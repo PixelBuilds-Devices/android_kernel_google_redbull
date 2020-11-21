@@ -441,21 +441,59 @@ static struct cpufreq_driver cpufreq_qcom_hw_driver = {
 	.ready		= qcom_cpufreq_ready,
 };
 
+static bool of_find_freq(u32 *of_table, int of_len, long frequency)
+{
+	int i;
+
+	if (!of_table)
+		return true;
+
+	for (i = 0; i < of_len; i++) {
+		if (frequency == of_table[i])
+			return true;
+	}
+
+	return false;
+}
+
 static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
-				    struct cpufreq_qcom *c)
+				    struct cpufreq_qcom *c,
+				    int domain_index)
 {
 	struct device *dev = &pdev->dev, *cpu_dev;
 	void __iomem *base_freq, *base_volt;
 	u32 data, src, lval, i, core_count, prev_cc, prev_freq, cur_freq, volt;
 	u32 vc;
 	unsigned long cpu;
+	int ret, of_len;
+	u32 *of_table = NULL;
+	char tbl_name[] = "qcom,cpufreq-table-##";
 
 	c->table = devm_kcalloc(dev, lut_max_entries + 1,
 				sizeof(*c->table), GFP_KERNEL);
 	if (!c->table)
 		return -ENOMEM;
 
+	snprintf(tbl_name, sizeof(tbl_name), "qcom,cpufreq-table-%d",
+		 domain_index);
+	if (of_find_property(dev->of_node, tbl_name, &of_len) && of_len > 0) {
+		of_len /= sizeof(*of_table);
+
+		of_table = devm_kcalloc(dev, of_len, sizeof(*of_table),
+					GFP_KERNEL);
+		if (!of_table) {
+			ret = -ENOMEM;
+			goto err_cpufreq_table;
+		}
+
+		ret = of_property_read_u32_array(dev->of_node, tbl_name,
+						 of_table, of_len);
+		if (ret)
+			goto err_of_table;
+	}
+
 	spin_lock_init(&c->skip_data.lock);
+
 	base_freq = c->reg_bases[REG_FREQ_LUT_TABLE];
 	base_volt = c->reg_bases[REG_VOLT_LUT_TABLE];
 
@@ -481,7 +519,7 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 		dev_dbg(dev, "index=%d freq=%d, core_count %d\n",
 			i, c->table[i].frequency, core_count);
 
-		if (core_count != c->max_cores) {
+		if (!of_find_freq(of_table, of_len, c->table[i].frequency)) {
 			if (core_count == (c->max_cores - 1)) {
 				c->skip_data.skip = true;
 				c->skip_data.high_temp_index = i;
@@ -494,16 +532,20 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 				c->skip_data.prev_index = i - 1;
 				c->skip_data.prev_cc = prev_cc;
 			} else {
+				c->table[i].frequency = CPUFREQ_ENTRY_INVALID;
+				cur_freq = CPUFREQ_ENTRY_INVALID;
+			}
+		} else {
+			if (core_count != c->max_cores) {
 				cur_freq = CPUFREQ_ENTRY_INVALID;
 				c->table[i].flags = CPUFREQ_BOOST_FREQ;
 			}
-		}
 
-		/*
-		 * Two of the same frequencies with the same core counts means
-		 * end of table.
-		 */
-		if (i > 0 && c->table[i - 1].frequency ==
+			/*
+			* Two of the same frequencies with the same core counts means
+			* end of table.
+			*/
+			if (i > 0 && c->table[i - 1].frequency ==
 				c->table[i].frequency) {
 			if (prev_cc == core_count) {
 				struct cpufreq_frequency_table *prev =
@@ -511,8 +553,9 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 
 				if (prev_freq == CPUFREQ_ENTRY_INVALID)
 					prev->flags = CPUFREQ_BOOST_FREQ;
+				}
+				break;
 			}
-			break;
 		}
 
 		prev_cc = core_count;
@@ -540,8 +583,17 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 				c->skip_data.prev_index,
 				c->skip_data.prev_cc);
 	}
+	
+	if (of_table)
+		devm_kfree(dev, of_table);
 
 	return 0;
+
+err_of_table:
+	devm_kfree(dev, of_table);
+err_cpufreq_table:
+	devm_kfree(dev, c->table);
+	return ret;
 }
 
 static int qcom_get_related_cpus(int index, struct cpumask *m)
@@ -625,7 +677,7 @@ static int qcom_cpu_resources_init(struct platform_device *pdev,
 	c->xo_rate = xo_rate;
 	c->cpu_hw_rate = cpu_hw_rate;
 
-	ret = qcom_cpufreq_hw_read_lut(pdev, c);
+	ret = qcom_cpufreq_hw_read_lut(pdev, c, index);
 	if (ret) {
 		dev_err(dev, "Domain-%d failed to read LUT\n", index);
 		return ret;
